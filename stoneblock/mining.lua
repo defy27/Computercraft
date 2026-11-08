@@ -1,26 +1,45 @@
 -- mining.lua
--- Home layout:
---   Fuel chest: left, at turtle elevation.
---   Output chest: directly above.
---   Field: 15 x 15, extending forward and right.
 --
--- Run one pass: mining.lua once
--- Run forever:  mining.lua
+-- Layout at the starting position:
+--   Fuel chest: directly LEFT, at turtle elevation.
+--   Output chest: directly ABOVE.
+--   Mining area: 15 x 15, extending FORWARD and RIGHT.
+--
+-- The starting position is above the first corner block.
+-- Keep the entire travel layer clear.
+--
+-- Run once:    mining.lua once
+-- Repeat:      mining.lua
+--
+-- Always start at home, facing the original direction.
+-- Position tracking is not preserved across reboots.
 
 local SIZE = 15
-local PAUSE_SECONDS = 5
 local REQUIRED_FUEL = 252 + 20
+local PAUSE_SECONDS = 5
+
 local args = { ... }
 local RUN_ONCE = args[1] == "once"
 
--- Relative coordinates:
--- x = blocks right of home
--- z = blocks forward of home
+-- Coordinates relative to home:
+-- x: right
+-- z: forward
 -- dir: 0 forward, 1 right, 2 backward, 3 left
 local x, z, dir = 0, 0, 0
 
-local dx = { [0] = 0, 1, 0, -1 }
-local dz = { [0] = 1, 0, -1, 0 }
+local dx = {
+    [0] = 0,
+    [1] = 1,
+    [2] = 0,
+    [3] = -1
+}
+
+local dz = {
+    [0] = 1,
+    [1] = 0,
+    [2] = -1,
+    [3] = 0
+}
 
 local function fail(message)
     error(message, 0)
@@ -47,13 +66,13 @@ end
 local function forward()
     local reason
 
-    -- Retry briefly for temporary obstructions, such as entities.
+    -- Retry briefly for temporary obstructions.
     for attempt = 1, 6 do
         local ok
         ok, reason = turtle.forward()
 
         if ok then
-            -- Update coordinates only after a successful move.
+            -- Track only successful movements.
             x = x + dx[dir]
             z = z + dz[dir]
             return
@@ -66,13 +85,14 @@ local function forward()
         sleep(0.5)
     end
 
-    -- Never dig forward: the travel layer should remain clear.
+    -- Do not dig forward into equipment or other blocks.
     fail("Movement blocked: " .. tostring(reason))
 end
 
 local function moveTo(targetX, targetZ)
     if x ~= targetX then
         face(targetX > x and 1 or 3)
+
         while x ~= targetX do
             forward()
         end
@@ -80,6 +100,7 @@ local function moveTo(targetX, targetZ)
 
     if z ~= targetZ then
         face(targetZ > z and 0 or 2)
+
         while z ~= targetZ do
             forward()
         end
@@ -87,32 +108,13 @@ local function moveTo(targetX, targetZ)
 end
 
 local function goHome()
-    -- Follow already visited cells to the appropriate edge,
-    -- then return along the edge and the first column.
+    -- Return through cells already visited during this pass.
     local edge = (x % 2 == 0) and 0 or (SIZE - 1)
 
     moveTo(x, edge)
     moveTo(0, edge)
     moveTo(0, 0)
     face(0)
-end
-
-local function resumeAt(savedX, savedZ, savedDir)
-    -- Reverse the route used by goHome().
-    local edge = (savedX % 2 == 0) and 0 or (SIZE - 1)
-
-    moveTo(0, edge)
-    moveTo(savedX, edge)
-    moveTo(savedX, savedZ)
-    face(savedDir)
-end
-
-local function emptySlot()
-    for slot = 1, 16 do
-        if turtle.getItemCount(slot) == 0 then
-            return slot
-        end
-    end
 end
 
 local function requireChest(inspect, location)
@@ -129,16 +131,54 @@ end
 local function unload()
     requireChest(turtle.inspectUp, "above home.")
 
+    -- Face into the clear field if items must be discarded.
+    -- Restore the previous direction afterward.
+    local savedDir = dir
+    face(0)
+
+    local warned = false
+
     for slot = 1, 16 do
-        turtle.select(slot)
+        if turtle.getItemCount(slot) > 0 then
+            turtle.select(slot)
 
-        -- Repeat because a chest may accept only part of a stack.
-        while turtle.getItemCount(slot) > 0 do
-            local ok = turtle.dropUp()
+            while turtle.getItemCount(slot) > 0 do
+                local before = turtle.getItemCount(slot)
 
-            if not ok then
-                fail("Output chest is full. Make space, then rerun.")
+                -- Deposit as much as possible above.
+                turtle.dropUp()
+
+                if turtle.getItemCount(slot) == before then
+                    if not warned then
+                        print("Output full; discarding remaining items.")
+                        warned = true
+                    end
+
+                    turtle.dropDown()
+
+                    -- If dropping below is blocked, try forward.
+                    if turtle.getItemCount(slot) == before then
+                        turtle.drop()
+                    end
+                end
+
+                -- Never get stuck trying to unload.
+                if turtle.getItemCount(slot) == before then
+                    print("Could not empty slot " .. slot .. "; continuing.")
+                    break
+                end
             end
+        end
+    end
+
+    face(savedDir)
+end
+
+local function emptySlot()
+    -- Used only when collecting fuel.
+    for slot = 1, 16 do
+        if turtle.getItemCount(slot) == 0 then
+            return slot
         end
     end
 end
@@ -154,17 +194,19 @@ local function ensureFuel()
     end
 
     local limit = turtle.getFuelLimit()
+
     if type(limit) == "number" and limit < REQUIRED_FUEL then
         fail("Configured fuel capacity is too low for this route.")
     end
 
-    -- Use any coal already carried before collecting more.
+    -- Consume any coal already carried first.
     for slot = 1, 16 do
         if enoughFuel() then
             return
         end
 
         local item = turtle.getItemDetail(slot)
+
         if item and item.name == "minecraft:coal" then
             turtle.select(slot)
             check(turtle.refuel())
@@ -175,7 +217,6 @@ local function ensureFuel()
         return
     end
 
-    -- Face the fuel chest on the original left side.
     face(3)
     requireChest(turtle.inspect, "on the left of home.")
 
@@ -185,31 +226,29 @@ local function ensureFuel()
         local slot = emptySlot()
 
         if not slot then
-            -- We are still at home; unloading works while turned.
             unload()
             slot = emptySlot()
         end
 
         if not slot then
-            fail("No inventory space available for coal.")
+            fail("Cannot make inventory space for coal.")
         end
 
         turtle.select(slot)
 
         local ok, reason = turtle.suck(64 - collected)
+
         if not ok then
             fail("Cannot collect coal: " .. tostring(reason))
         end
 
-        -- The selected slot was empty and can hold the whole batch.
         local item = turtle.getItemDetail(slot)
+
         if not item or item.name ~= "minecraft:coal" then
             fail("The fuel chest must contain only coal.")
         end
 
         collected = collected + item.count
-
-        -- Burn the collected batch into the internal fuel buffer.
         check(turtle.refuel())
     end
 
@@ -221,33 +260,16 @@ local function ensureFuel()
 end
 
 local function mineBelow()
-    -- Air and liquids do not need digging.
     if not turtle.detectDown() then
         return
     end
 
-    local slot = emptySlot()
-
-    if not slot then
-        local savedX, savedZ, savedDir = x, z, dir
-
-        print("Inventory full; returning to unload.")
-        goHome()
-        unload()
-        ensureFuel()
-        resumeAt(savedX, savedZ, savedDir)
-
-        slot = emptySlot()
-    end
-
-    if not slot then
-        fail("No inventory space after unloading.")
-    end
-
-    turtle.select(slot)
-
-    -- Exactly one dig attempt per cell avoids getting stuck
-    -- digging an instantly regenerating block forever.
+    -- No slot changes or inventory checks here.
+    -- Available slots fill automatically.
+    -- Excess drops are left in the world if inventory is full.
+    --
+    -- Dig only once per visit so instant regeneration cannot
+    -- trap the turtle in an endless digging loop.
     local ok, reason = turtle.digDown()
 
     if not ok and turtle.detectDown() then
@@ -256,6 +278,9 @@ local function mineBelow()
 end
 
 local function mineArea()
+    -- Keep this slot selected for the entire pass.
+    turtle.select(1)
+
     for column = 0, SIZE - 1 do
         for position = 1, SIZE do
             mineBelow()
@@ -266,7 +291,8 @@ local function mineArea()
         end
 
         if column < SIZE - 1 then
-            -- Shift one column right, then reverse direction.
+            -- Shift right, then traverse the next column
+            -- in the opposite direction.
             face(1)
             forward()
             face(column % 2 == 0 and 2 or 0)
@@ -279,18 +305,20 @@ local function main()
 
     while true do
         ensureFuel()
-        unload() -- Also clears any inventory present at startup.
+        unload()
 
         pass = pass + 1
+
         print(("Pass %d; fuel: %s"):format(
-            pass, tostring(turtle.getFuelLevel())
+            pass,
+            tostring(turtle.getFuelLevel())
         ))
 
         mineArea()
         goHome()
         unload()
 
-        print("Home, facing original direction; unloaded.")
+        print("Home, original direction restored; pass complete.")
 
         if RUN_ONCE then
             return
@@ -306,7 +334,7 @@ if not ok then
     printError(tostring(reason))
 
     if tostring(reason):find("Terminated", 1, true) then
-        -- Respect Ctrl+T as an immediate stop.
+        -- Ctrl+T stops immediately without further movement.
         print("Interrupted. Restore home position before restarting.")
     else
         print("Attempting to return home and unload...")
@@ -317,7 +345,7 @@ if not ok then
         end)
 
         if recovered then
-            print("Home and unloaded. Fix the problem, then rerun.")
+            print("Returned home. Fix the problem, then rerun.")
         else
             printError("Recovery stopped: " .. tostring(recoveryError))
         end
